@@ -1,272 +1,269 @@
-using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
-using System.Threading;
 
-namespace SocketAsyncClient
+namespace SocketAsyncClient;
+
+public sealed class SocketClient : IDisposable
 {
-    public sealed class SocketClient : IDisposable
+    private int bufferSize = 60000;
+    private const int MessageHeaderSize = 4;
+
+    private Socket clientSocket;
+    private bool connected = false;
+    private IPEndPoint hostEndPoint;
+    private AutoResetEvent autoConnectEvent;
+    private AutoResetEvent autoSendEvent;
+    private SocketAsyncEventArgs sendEventArgs;
+    private SocketAsyncEventArgs receiveEventArgs;
+    private BlockingCollection<byte[]> sendingQueue;
+    private BlockingCollection<byte[]> receivedMessageQueue;
+    private Thread sendMessageWorker;
+    private Thread processReceivedMessageWorker;
+
+    public SocketClient(IPEndPoint hostEndPoint)
     {
-        private int bufferSize = 60000;
-        private const int MessageHeaderSize = 4;
+        this.hostEndPoint = hostEndPoint;
+        autoConnectEvent = new AutoResetEvent(false);
+        autoSendEvent = new AutoResetEvent(false);
+        sendingQueue = new BlockingCollection<byte[]>();
+        receivedMessageQueue = new BlockingCollection<byte[]>();
+        clientSocket = new Socket(this.hostEndPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+        sendMessageWorker = new Thread(new ThreadStart(SendQueueMessage));
+        processReceivedMessageWorker = new Thread(new ThreadStart(ProcessReceivedMessage));
 
-        private Socket clientSocket;
-        private bool connected = false;
-        private IPEndPoint hostEndPoint;
-        private AutoResetEvent autoConnectEvent;
-        private AutoResetEvent autoSendEvent;
-        private SocketAsyncEventArgs sendEventArgs;
-        private SocketAsyncEventArgs receiveEventArgs;
-        private BlockingCollection<byte[]> sendingQueue;
-        private BlockingCollection<byte[]> receivedMessageQueue;
-        private Thread sendMessageWorker;
-        private Thread processReceivedMessageWorker;
+        sendEventArgs = new SocketAsyncEventArgs();
+        sendEventArgs.UserToken = clientSocket;
+        sendEventArgs.RemoteEndPoint = this.hostEndPoint;
+        sendEventArgs.Completed += new EventHandler<SocketAsyncEventArgs>(OnSend);
 
-        public SocketClient(IPEndPoint hostEndPoint)
-        {
-            this.hostEndPoint = hostEndPoint;
-            this.autoConnectEvent = new AutoResetEvent(false);
-            this.autoSendEvent = new AutoResetEvent(false);
-            this.sendingQueue = new BlockingCollection<byte[]>();
-            this.receivedMessageQueue = new BlockingCollection<byte[]>();
-            this.clientSocket = new Socket(this.hostEndPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
-            this.sendMessageWorker = new Thread(new ThreadStart(SendQueueMessage));
-            this.processReceivedMessageWorker = new Thread(new ThreadStart(ProcessReceivedMessage));
-
-            this.sendEventArgs = new SocketAsyncEventArgs();
-            this.sendEventArgs.UserToken = this.clientSocket;
-            this.sendEventArgs.RemoteEndPoint = this.hostEndPoint;
-            this.sendEventArgs.Completed += new EventHandler<SocketAsyncEventArgs>(OnSend);
-
-            this.receiveEventArgs = new SocketAsyncEventArgs();
-            this.receiveEventArgs.UserToken = new AsyncUserToken(clientSocket);
-            this.receiveEventArgs.RemoteEndPoint = this.hostEndPoint;
-            this.receiveEventArgs.SetBuffer(new Byte[bufferSize], 0, bufferSize);
-            this.receiveEventArgs.Completed += new EventHandler<SocketAsyncEventArgs>(OnReceive);
-        }
-
-        public void Connect()
-        {
-            SocketAsyncEventArgs connectArgs = new SocketAsyncEventArgs();
-            connectArgs.UserToken = this.clientSocket;
-            connectArgs.RemoteEndPoint = this.hostEndPoint;
-            connectArgs.Completed += new EventHandler<SocketAsyncEventArgs>(OnConnect);
-
-            clientSocket.ConnectAsync(connectArgs);
-            autoConnectEvent.WaitOne();
-
-            SocketError errorCode = connectArgs.SocketError;
-            if (errorCode != SocketError.Success)
-            {
-                throw new SocketException((Int32)errorCode);
-            }
-            sendMessageWorker.Start();
-            processReceivedMessageWorker.Start();
-
-            if (!clientSocket.ReceiveAsync(receiveEventArgs))
-            {
-                ProcessReceive(receiveEventArgs);
-            }
-        }
-
-        public void Disconnect()
-        {
-            clientSocket.Disconnect(false);
-        }
-        public void Send(byte[] message)
-        {
-            sendingQueue.Add(message);
-        }
-
-        private void OnConnect(object sender, SocketAsyncEventArgs e)
-        {
-            autoConnectEvent.Set();
-            connected = (e.SocketError == SocketError.Success);
-        }
-        private void OnSend(object sender, SocketAsyncEventArgs e)
-        {
-            autoSendEvent.Set();
-        }
-        private void SendQueueMessage()
-        {
-            while (true)
-            {
-                var message = sendingQueue.Take();
-                if (message != null)
-                {
-                    sendEventArgs.SetBuffer(message, 0, message.Length);
-                    clientSocket.SendAsync(sendEventArgs);
-                    autoSendEvent.WaitOne();
-                }
-            }
-        }
-
-        private void OnReceive(object sender, SocketAsyncEventArgs e)
-        {
-            ProcessReceive(e);
-        }
-        private void ProcessReceive(SocketAsyncEventArgs e)
-        {
-            if (e.BytesTransferred > 0 && e.SocketError == SocketError.Success)
-            {
-                AsyncUserToken token = e.UserToken as AsyncUserToken;
-
-                //´¦Àí½ÓÊÕµ½µÄÊý¾Ý
-                ProcessReceivedData(token.DataStartOffset, token.NextReceiveOffset - token.DataStartOffset + e.BytesTransferred, 0, token, e);
-
-                //¸üÐÂÏÂÒ»¸öÒª½ÓÊÕÊý¾ÝµÄÆðÊ¼Î»ÖÃ
-                token.NextReceiveOffset += e.BytesTransferred;
-
-                //Èç¹û´ïµ½»º³åÇøµÄ½áÎ²£¬Ôò½«NextReceiveOffset¸´Î»µ½»º³åÇøÆðÊ¼Î»ÖÃ£¬²¢Ç¨ÒÆ¿ÉÄÜÐèÒªÇ¨ÒÆµÄÎ´´¦ÀíµÄÊý¾Ý
-                if (token.NextReceiveOffset == e.Buffer.Length)
-                {
-                    //½«NextReceiveOffset¸´Î»µ½»º³åÇøÆðÊ¼Î»ÖÃ
-                    token.NextReceiveOffset = 0;
-
-                    //Èç¹û»¹ÓÐÎ´´¦ÀíµÄÊý¾Ý£¬Ôò°ÑÕâÐ©Êý¾ÝÇ¨ÒÆµ½Êý¾Ý»º³åÇøµÄÆðÊ¼Î»ÖÃ
-                    if (token.DataStartOffset < e.Buffer.Length)
-                    {
-                        var notYesProcessDataSize = e.Buffer.Length - token.DataStartOffset;
-                        Buffer.BlockCopy(e.Buffer, token.DataStartOffset, e.Buffer, 0, notYesProcessDataSize);
-
-                        //Êý¾ÝÇ¨ÒÆµ½»º³åÇøÆðÊ¼Î»ÖÃºó£¬ÐèÒªÔÙ´Î¸üÐÂNextReceiveOffset
-                        token.NextReceiveOffset = notYesProcessDataSize;
-                    }
-
-                    token.DataStartOffset = 0;
-                }
-
-                //¸üÐÂ½ÓÊÕÊý¾ÝµÄ»º³åÇøÏÂ´Î½ÓÊÕÊý¾ÝµÄÆðÊ¼Î»ÖÃºÍ×î´ó¿É½ÓÊÕÊý¾ÝµÄ³¤¶È
-                e.SetBuffer(token.NextReceiveOffset, e.Buffer.Length - token.NextReceiveOffset);
-
-                //½ÓÊÕºóÐøµÄÊý¾Ý
-                if (!token.Socket.ReceiveAsync(e))
-                {
-                    ProcessReceive(e);
-                }
-            }
-            else
-            {
-                ProcessError(e);
-            }
-        }
-        private void ProcessReceivedData(int dataStartOffset, int totalReceivedDataSize, int alreadyProcessedDataSize, AsyncUserToken token, SocketAsyncEventArgs e)
-        {
-            if (alreadyProcessedDataSize >= totalReceivedDataSize)
-            {
-                return;
-            }
-
-            if (token.MessageSize == null)
-            {
-                //Èç¹ûÖ®Ç°½ÓÊÕµ½µ½Êý¾Ý¼ÓÉÏµ±Ç°½ÓÊÕµ½µÄÊý¾Ý´óÓÚÏûÏ¢Í·µÄ´óÐ¡£¬Ôò¿ÉÒÔ½âÎöÏûÏ¢Í·
-                if (totalReceivedDataSize > MessageHeaderSize)
-                {
-                    //½âÎöÏûÏ¢³¤¶È
-                    var headerData = new byte[MessageHeaderSize];
-                    Buffer.BlockCopy(e.Buffer, dataStartOffset, headerData, 0, MessageHeaderSize);
-                    var messageSize = BitConverter.ToInt32(headerData, 0);
-
-                    token.MessageSize = messageSize;
-                    token.DataStartOffset = dataStartOffset + MessageHeaderSize;
-
-                    //µÝ¹é´¦Àí
-                    ProcessReceivedData(token.DataStartOffset, totalReceivedDataSize, alreadyProcessedDataSize + MessageHeaderSize, token, e);
-                }
-                //Èç¹ûÖ®Ç°½ÓÊÕµ½µ½Êý¾Ý¼ÓÉÏµ±Ç°½ÓÊÕµ½µÄÊý¾ÝÈÔÈ»Ã»ÓÐ´óÓÚÏûÏ¢Í·µÄ´óÐ¡£¬ÔòÐèÒª¼ÌÐø½ÓÊÕºóÐøµÄ×Ö½Ú
-                else
-                {
-                    //ÕâÀï²»ÐèÒª×öÊ²Ã´ÊÂÇé
-                }
-            }
-            else
-            {
-                var messageSize = token.MessageSize.Value;
-                //ÅÐ¶Ïµ±Ç°ÀÛ¼Æ½ÓÊÕµ½µÄ×Ö½ÚÊý¼õÈ¥ÒÑ¾­´¦ÀíµÄ×Ö½ÚÊýÊÇ·ñ´óÓÚÏûÏ¢µÄ³¤¶È£¬Èç¹û´óÓÚ£¬ÔòËµÃ÷¿ÉÒÔ½âÎöÏûÏ¢ÁË
-                if (totalReceivedDataSize - alreadyProcessedDataSize >= messageSize)
-                {
-                    var messageData = new byte[messageSize];
-                    Buffer.BlockCopy(e.Buffer, dataStartOffset, messageData, 0, messageSize);
-                    ProcessMessage(messageData);
-
-                    //ÏûÏ¢´¦ÀíÍêºó£¬ÐèÒªÇåÀítoken£¬ÒÔ±ã½ÓÊÕÏÂÒ»¸öÏûÏ¢
-                    token.DataStartOffset = dataStartOffset + messageSize;
-                    token.MessageSize = null;
-
-                    //µÝ¹é´¦Àí
-                    ProcessReceivedData(token.DataStartOffset, totalReceivedDataSize, alreadyProcessedDataSize + messageSize, token, e);
-                }
-                //ËµÃ÷Ê£ÏÂµÄ×Ö½ÚÊý»¹²»¹»×ª»¯ÎªÏûÏ¢£¬ÔòÐèÒª¼ÌÐø½ÓÊÕºóÐøµÄ×Ö½Ú
-                else
-                {
-                    //ÕâÀï²»ÐèÒª×öÊ²Ã´ÊÂÇé
-                }
-            }
-        }
-        private void ProcessMessage(byte[] messageData)
-        {
-            receivedMessageQueue.Add(messageData);
-        }
-        private void ProcessReceivedMessage()
-        {
-            while (true)
-            {
-                var message = receivedMessageQueue.Take();
-                if (message != null)
-                {
-                    var current = Interlocked.Increment(ref Program._receivedMessageCount);
-                    if (current == 1)
-                    {
-                        Program._watch = Stopwatch.StartNew();
-                    }
-                    if (current % 1000 == 0)
-                    {
-                        Console.WriteLine("received reply message, length:{0}, count:{1}, timeSpent:{2}", message.Length, current, Program._watch.ElapsedMilliseconds);
-                    }
-                }
-            }
-        }
-
-        private void ProcessError(SocketAsyncEventArgs e)
-        {
-            //Socket s = e.UserToken as Socket;
-            //if (s.Connected)
-            //{
-            //    // close the socket associated with the client
-            //    try
-            //    {
-            //        s.Shutdown(SocketShutdown.Both);
-            //    }
-            //    catch (Exception)
-            //    {
-            //        // throws if client process has already closed
-            //    }
-            //    finally
-            //    {
-            //        if (s.Connected)
-            //        {
-            //            s.Close();
-            //        }
-            //    }
-            //}
-
-            // Throw the SocketException
-            throw new SocketException((Int32)e.SocketError);
-        }
-
-        #region IDisposable Members
-
-        public void Dispose()
-        {
-            autoConnectEvent.Close();
-            if (this.clientSocket.Connected)
-            {
-                this.clientSocket.Close();
-            }
-        }
-
-        #endregion
+        receiveEventArgs = new SocketAsyncEventArgs();
+        receiveEventArgs.UserToken = new AsyncUserToken(clientSocket);
+        receiveEventArgs.RemoteEndPoint = this.hostEndPoint;
+        receiveEventArgs.SetBuffer(new byte[bufferSize], 0, bufferSize);
+        receiveEventArgs.Completed += new EventHandler<SocketAsyncEventArgs>(OnReceive);
     }
+
+    public void Connect()
+    {
+        SocketAsyncEventArgs connectArgs = new SocketAsyncEventArgs();
+        connectArgs.UserToken = clientSocket;
+        connectArgs.RemoteEndPoint = hostEndPoint;
+        connectArgs.Completed += new EventHandler<SocketAsyncEventArgs>(OnConnect);
+
+        clientSocket.ConnectAsync(connectArgs);
+        autoConnectEvent.WaitOne();
+
+        SocketError errorCode = connectArgs.SocketError;
+        if (errorCode != SocketError.Success)
+        {
+            throw new SocketException((int)errorCode);
+        }
+        sendMessageWorker.Start();
+        processReceivedMessageWorker.Start();
+
+        if (!clientSocket.ReceiveAsync(receiveEventArgs))
+        {
+            ProcessReceive(receiveEventArgs);
+        }
+    }
+
+    public void Disconnect()
+    {
+        clientSocket.Disconnect(false);
+    }
+    public void Send(byte[] message)
+    {
+        sendingQueue.Add(message);
+    }
+
+    private void OnConnect(object sender, SocketAsyncEventArgs e)
+    {
+        autoConnectEvent.Set();
+        connected = (e.SocketError == SocketError.Success);
+    }
+    private void OnSend(object sender, SocketAsyncEventArgs e)
+    {
+        autoSendEvent.Set();
+    }
+    private void SendQueueMessage()
+    {
+        while (true)
+        {
+            var message = sendingQueue.Take();
+            if (message != null)
+            {
+                sendEventArgs.SetBuffer(message, 0, message.Length);
+                clientSocket.SendAsync(sendEventArgs);
+                autoSendEvent.WaitOne();
+            }
+        }
+    }
+
+    private void OnReceive(object sender, SocketAsyncEventArgs e)
+    {
+        ProcessReceive(e);
+    }
+    private void ProcessReceive(SocketAsyncEventArgs e)
+    {
+        if (e.BytesTransferred > 0 && e.SocketError == SocketError.Success)
+        {
+            AsyncUserToken token = e.UserToken as AsyncUserToken;
+
+            //ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Õµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+            ProcessReceivedData(token.DataStartOffset, token.NextReceiveOffset - token.DataStartOffset + e.BytesTransferred, 0, token, e);
+
+            //ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò»ï¿½ï¿½Òªï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ýµï¿½ï¿½ï¿½Ê¼Î»ï¿½ï¿½
+            token.NextReceiveOffset += e.BytesTransferred;
+
+            //ï¿½ï¿½ï¿½ï¿½ïµ½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä½ï¿½Î²ï¿½ï¿½ï¿½ï¿½NextReceiveOffsetï¿½ï¿½Î»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê¼Î»ï¿½Ã£ï¿½ï¿½ï¿½Ç¨ï¿½Æ¿ï¿½ï¿½ï¿½ï¿½ï¿½ÒªÇ¨ï¿½Æµï¿½Î´ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+            if (token.NextReceiveOffset == e.Buffer.Length)
+            {
+                //ï¿½ï¿½NextReceiveOffsetï¿½ï¿½Î»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê¼Î»ï¿½ï¿½
+                token.NextReceiveOffset = 0;
+
+                //ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Î´ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ý£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ð©ï¿½ï¿½ï¿½ï¿½Ç¨ï¿½Æµï¿½ï¿½ï¿½ï¿½Ý»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê¼Î»ï¿½ï¿½
+                if (token.DataStartOffset < e.Buffer.Length)
+                {
+                    var notYesProcessDataSize = e.Buffer.Length - token.DataStartOffset;
+                    Buffer.BlockCopy(e.Buffer, token.DataStartOffset, e.Buffer, 0, notYesProcessDataSize);
+
+                    //ï¿½ï¿½ï¿½ï¿½Ç¨ï¿½Æµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê¼Î»ï¿½Ãºï¿½ï¿½ï¿½Òªï¿½Ù´Î¸ï¿½ï¿½ï¿½NextReceiveOffset
+                    token.NextReceiveOffset = notYesProcessDataSize;
+                }
+
+                token.DataStartOffset = 0;
+            }
+
+            //ï¿½ï¿½ï¿½Â½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ÝµÄ»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Â´Î½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ýµï¿½ï¿½ï¿½Ê¼Î»ï¿½Ãºï¿½ï¿½ï¿½ï¿½É½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ÝµÄ³ï¿½ï¿½ï¿½
+            e.SetBuffer(token.NextReceiveOffset, e.Buffer.Length - token.NextReceiveOffset);
+
+            //ï¿½ï¿½ï¿½Õºï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+            if (!token.Socket.ReceiveAsync(e))
+            {
+                ProcessReceive(e);
+            }
+        }
+        else
+        {
+            ProcessError(e);
+        }
+    }
+    private void ProcessReceivedData(int dataStartOffset, int totalReceivedDataSize, int alreadyProcessedDataSize, AsyncUserToken token, SocketAsyncEventArgs e)
+    {
+        if (alreadyProcessedDataSize >= totalReceivedDataSize)
+        {
+            return;
+        }
+
+        if (token.MessageSize == null)
+        {
+            //ï¿½ï¿½ï¿½Ö®Ç°ï¿½ï¿½ï¿½Õµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ý¼ï¿½ï¿½Ïµï¿½Ç°ï¿½ï¿½ï¿½Õµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ý´ï¿½ï¿½ï¿½ï¿½ï¿½Ï¢Í·ï¿½Ä´ï¿½Ð¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ô½ï¿½ï¿½ï¿½ï¿½ï¿½Ï¢Í·
+            if (totalReceivedDataSize > MessageHeaderSize)
+            {
+                //ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ï¢ï¿½ï¿½ï¿½ï¿½
+                var headerData = new byte[MessageHeaderSize];
+                Buffer.BlockCopy(e.Buffer, dataStartOffset, headerData, 0, MessageHeaderSize);
+                var messageSize = BitConverter.ToInt32(headerData, 0);
+
+                token.MessageSize = messageSize;
+                token.DataStartOffset = dataStartOffset + MessageHeaderSize;
+
+                //ï¿½Ý¹é´¦ï¿½ï¿½
+                ProcessReceivedData(token.DataStartOffset, totalReceivedDataSize, alreadyProcessedDataSize + MessageHeaderSize, token, e);
+            }
+            //ï¿½ï¿½ï¿½Ö®Ç°ï¿½ï¿½ï¿½Õµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ý¼ï¿½ï¿½Ïµï¿½Ç°ï¿½ï¿½ï¿½Õµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½È»Ã»ï¿½Ð´ï¿½ï¿½ï¿½ï¿½ï¿½Ï¢Í·ï¿½Ä´ï¿½Ð¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Òªï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Õºï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö½ï¿½
+            else
+            {
+                //ï¿½ï¿½ï¿½ï²»ï¿½ï¿½Òªï¿½ï¿½Ê²Ã´ï¿½ï¿½ï¿½ï¿½
+            }
+        }
+        else
+        {
+            var messageSize = token.MessageSize.Value;
+            //ï¿½Ð¶Ïµï¿½Ç°ï¿½Û¼Æ½ï¿½ï¿½Õµï¿½ï¿½ï¿½ï¿½Ö½ï¿½ï¿½ï¿½ï¿½ï¿½È¥ï¿½Ñ¾ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö½ï¿½ï¿½ï¿½ï¿½Ç·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ï¢ï¿½Ä³ï¿½ï¿½È£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ú£ï¿½ï¿½ï¿½Ëµï¿½ï¿½ï¿½ï¿½ï¿½Ô½ï¿½ï¿½ï¿½ï¿½ï¿½Ï¢ï¿½ï¿½
+            if (totalReceivedDataSize - alreadyProcessedDataSize >= messageSize)
+            {
+                var messageData = new byte[messageSize];
+                Buffer.BlockCopy(e.Buffer, dataStartOffset, messageData, 0, messageSize);
+                ProcessMessage(messageData);
+
+                //ï¿½ï¿½Ï¢ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Òªï¿½ï¿½ï¿½ï¿½tokenï¿½ï¿½ï¿½Ô±ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò»ï¿½ï¿½ï¿½ï¿½Ï¢
+                token.DataStartOffset = dataStartOffset + messageSize;
+                token.MessageSize = null;
+
+                //ï¿½Ý¹é´¦ï¿½ï¿½
+                ProcessReceivedData(token.DataStartOffset, totalReceivedDataSize, alreadyProcessedDataSize + messageSize, token, e);
+            }
+            //Ëµï¿½ï¿½Ê£ï¿½Âµï¿½ï¿½Ö½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½×ªï¿½ï¿½Îªï¿½ï¿½Ï¢ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Òªï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Õºï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö½ï¿½
+            else
+            {
+                //ï¿½ï¿½ï¿½ï²»ï¿½ï¿½Òªï¿½ï¿½Ê²Ã´ï¿½ï¿½ï¿½ï¿½
+            }
+        }
+    }
+    private void ProcessMessage(byte[] messageData)
+    {
+        receivedMessageQueue.Add(messageData);
+    }
+    private void ProcessReceivedMessage()
+    {
+        while (true)
+        {
+            var message = receivedMessageQueue.Take();
+            if (message != null)
+            {
+                var current = Interlocked.Increment(ref Program._receivedMessageCount);
+                if (current == 1)
+                {
+                    Program._watch = Stopwatch.StartNew();
+                }
+                if (current % 1000 == 0)
+                {
+                    Console.WriteLine("received reply message, length:{0}, count:{1}, timeSpent:{2}", message.Length, current, Program._watch.ElapsedMilliseconds);
+                }
+            }
+        }
+    }
+
+    private void ProcessError(SocketAsyncEventArgs e)
+    {
+        //Socket s = e.UserToken as Socket;
+        //if (s.Connected)
+        //{
+        //    // close the socket associated with the client
+        //    try
+        //    {
+        //        s.Shutdown(SocketShutdown.Both);
+        //    }
+        //    catch (Exception)
+        //    {
+        //        // throws if client process has already closed
+        //    }
+        //    finally
+        //    {
+        //        if (s.Connected)
+        //        {
+        //            s.Close();
+        //        }
+        //    }
+        //}
+
+        // Throw the SocketException
+        throw new SocketException((int)e.SocketError);
+    }
+
+    #region IDisposable Members
+
+    public void Dispose()
+    {
+        autoConnectEvent.Close();
+        if (clientSocket.Connected)
+        {
+            clientSocket.Close();
+        }
+    }
+
+    #endregion
 }

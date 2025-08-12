@@ -1,305 +1,302 @@
-using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
-using System.Threading;
 
-namespace SocketAsyncServer
+namespace SocketAsyncServer;
+
+public sealed class SocketListener
 {
-    public sealed class SocketListener
+    private const int MessageHeaderSize = 4;
+    private int _receivedMessageCount = 0;  //for testing
+    private Stopwatch _watch;  //for testing
+
+    private BlockingCollection<MessageData> sendingQueue;
+    private Thread sendMessageWorker;
+
+    private static Mutex _mutex = new Mutex();
+    private Socket _listenSocket;
+    private int _bufferSize;
+    private int _connectedSocketCount;
+    private int _maxConnectionCount;
+    private SocketAsyncEventArgsPool _socketAsyncReceiveEventArgsPool;
+    private SocketAsyncEventArgsPool _socketAsyncSendEventArgsPool;
+    private Semaphore _acceptedClientsSemaphore;
+    private AutoResetEvent waitSendEvent;
+
+    public SocketListener(int maxConnectionCount, int bufferSize)
     {
-        private const int MessageHeaderSize = 4;
-        private int _receivedMessageCount = 0;  //for testing
-        private Stopwatch _watch;  //for testing
+        _maxConnectionCount = maxConnectionCount;
+        _bufferSize = bufferSize;
+        _socketAsyncReceiveEventArgsPool = new SocketAsyncEventArgsPool(maxConnectionCount);
+        _socketAsyncSendEventArgsPool = new SocketAsyncEventArgsPool(maxConnectionCount);
+        _acceptedClientsSemaphore = new Semaphore(maxConnectionCount, maxConnectionCount);
 
-        private BlockingCollection<MessageData> sendingQueue;
-        private Thread sendMessageWorker;
+        sendingQueue = new BlockingCollection<MessageData>();
+        sendMessageWorker = new Thread(new ThreadStart(SendQueueMessage));
 
-        private static Mutex _mutex = new Mutex();
-        private Socket _listenSocket;
-        private int _bufferSize;
-        private int _connectedSocketCount;
-        private int _maxConnectionCount;
-        private SocketAsyncEventArgsPool _socketAsyncReceiveEventArgsPool;
-        private SocketAsyncEventArgsPool _socketAsyncSendEventArgsPool;
-        private Semaphore _acceptedClientsSemaphore;
-        private AutoResetEvent waitSendEvent;
-
-        public SocketListener(int maxConnectionCount, int bufferSize)
+        for (int i = 0; i < maxConnectionCount; i++)
         {
-            _maxConnectionCount = maxConnectionCount;
-            _bufferSize = bufferSize;
-            _socketAsyncReceiveEventArgsPool = new SocketAsyncEventArgsPool(maxConnectionCount);
-            _socketAsyncSendEventArgsPool = new SocketAsyncEventArgsPool(maxConnectionCount);
-            _acceptedClientsSemaphore = new Semaphore(maxConnectionCount, maxConnectionCount);
-
-            sendingQueue = new BlockingCollection<MessageData>();
-            sendMessageWorker = new Thread(new ThreadStart(SendQueueMessage));
-
-            for (int i = 0; i < maxConnectionCount; i++)
-            {
-                SocketAsyncEventArgs socketAsyncEventArgs = new SocketAsyncEventArgs();
-                socketAsyncEventArgs.Completed += OnIOCompleted;
-                socketAsyncEventArgs.SetBuffer(new Byte[bufferSize], 0, bufferSize);
-                _socketAsyncReceiveEventArgsPool.Push(socketAsyncEventArgs);
-            }
-
-            for (int i = 0; i < maxConnectionCount; i++)
-            {
-                SocketAsyncEventArgs socketAsyncEventArgs = new SocketAsyncEventArgs();
-                socketAsyncEventArgs.Completed += OnIOCompleted;
-                socketAsyncEventArgs.SetBuffer(new Byte[bufferSize], 0, bufferSize);
-                _socketAsyncSendEventArgsPool.Push(socketAsyncEventArgs);
-            }
-
-            waitSendEvent = new AutoResetEvent(false);
+            SocketAsyncEventArgs socketAsyncEventArgs = new SocketAsyncEventArgs();
+            socketAsyncEventArgs.Completed += OnIOCompleted;
+            socketAsyncEventArgs.SetBuffer(new byte[bufferSize], 0, bufferSize);
+            _socketAsyncReceiveEventArgsPool.Push(socketAsyncEventArgs);
         }
 
-        public void Start(IPEndPoint localEndPoint)
+        for (int i = 0; i < maxConnectionCount; i++)
         {
-            _listenSocket = new Socket(localEndPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
-            _listenSocket.ReceiveBufferSize = _bufferSize;
-            _listenSocket.SendBufferSize = _bufferSize;
-            _listenSocket.Bind(localEndPoint);
-            _listenSocket.Listen(_maxConnectionCount);
-            sendMessageWorker.Start();
-            StartAccept(null);
-            _mutex.WaitOne();
-        }
-        public void Stop()
-        {
-            try
-            {
-                _listenSocket.Close();
-            }
-            catch { }
-            _mutex.ReleaseMutex();
+            SocketAsyncEventArgs socketAsyncEventArgs = new SocketAsyncEventArgs();
+            socketAsyncEventArgs.Completed += OnIOCompleted;
+            socketAsyncEventArgs.SetBuffer(new byte[bufferSize], 0, bufferSize);
+            _socketAsyncSendEventArgsPool.Push(socketAsyncEventArgs);
         }
 
-        private void OnIOCompleted(object sender, SocketAsyncEventArgs e)
-        {
-            switch (e.LastOperation)
-            {
-                case SocketAsyncOperation.Receive:
-                    ProcessReceive(e);
-                    break;
-                case SocketAsyncOperation.Send:
-                    ProcessSend(e);
-                    break;
-                default:
-                    throw new ArgumentException("The last operation completed on the socket was not a receive or send");
-            }
-        }
-        private void StartAccept(SocketAsyncEventArgs acceptEventArg)
-        {
-            if (acceptEventArg == null)
-            {
-                acceptEventArg = new SocketAsyncEventArgs();
-                acceptEventArg.Completed += (sender, e) => ProcessAccept(e);
-            }
-            else
-            {
-                acceptEventArg.AcceptSocket = null;
-            }
+        waitSendEvent = new AutoResetEvent(false);
+    }
 
-            _acceptedClientsSemaphore.WaitOne();
-            if (!_listenSocket.AcceptAsync(acceptEventArg))
-            {
-                ProcessAccept(acceptEventArg);
-            }
-        }
-        private void ProcessAccept(SocketAsyncEventArgs e)
+    public void Start(IPEndPoint localEndPoint)
+    {
+        _listenSocket = new Socket(localEndPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+        _listenSocket.ReceiveBufferSize = _bufferSize;
+        _listenSocket.SendBufferSize = _bufferSize;
+        _listenSocket.Bind(localEndPoint);
+        _listenSocket.Listen(_maxConnectionCount);
+        sendMessageWorker.Start();
+        StartAccept(null);
+        _mutex.WaitOne();
+    }
+    public void Stop()
+    {
+        try
         {
-            try
+            _listenSocket.Close();
+        }
+        catch { }
+        _mutex.ReleaseMutex();
+    }
+
+    private void OnIOCompleted(object sender, SocketAsyncEventArgs e)
+    {
+        switch (e.LastOperation)
+        {
+            case SocketAsyncOperation.Receive:
+                ProcessReceive(e);
+                break;
+            case SocketAsyncOperation.Send:
+                ProcessSend(e);
+                break;
+            default:
+                throw new ArgumentException("The last operation completed on the socket was not a receive or send");
+        }
+    }
+    private void StartAccept(SocketAsyncEventArgs acceptEventArg)
+    {
+        if (acceptEventArg == null)
+        {
+            acceptEventArg = new SocketAsyncEventArgs();
+            acceptEventArg.Completed += (sender, e) => ProcessAccept(e);
+        }
+        else
+        {
+            acceptEventArg.AcceptSocket = null;
+        }
+
+        _acceptedClientsSemaphore.WaitOne();
+        if (!_listenSocket.AcceptAsync(acceptEventArg))
+        {
+            ProcessAccept(acceptEventArg);
+        }
+    }
+    private void ProcessAccept(SocketAsyncEventArgs e)
+    {
+        try
+        {
+            SocketAsyncEventArgs readEventArgs = _socketAsyncReceiveEventArgsPool.Pop();
+            if (readEventArgs != null)
             {
-                SocketAsyncEventArgs readEventArgs = _socketAsyncReceiveEventArgsPool.Pop();
-                if (readEventArgs != null)
+                readEventArgs.UserToken = new AsyncUserToken(e.AcceptSocket);
+                Interlocked.Increment(ref _connectedSocketCount);
+                Console.WriteLine("Client connection accepted. There are {0} clients connected to the server", _connectedSocketCount);
+                if (!e.AcceptSocket.ReceiveAsync(readEventArgs))
                 {
-                    readEventArgs.UserToken = new AsyncUserToken(e.AcceptSocket);
-                    Interlocked.Increment(ref _connectedSocketCount);
-                    Console.WriteLine("Client connection accepted. There are {0} clients connected to the server", _connectedSocketCount);
-                    if (!e.AcceptSocket.ReceiveAsync(readEventArgs))
-                    {
-                        ProcessReceive(readEventArgs);
-                    }
-                }
-                else
-                {
-                    Console.WriteLine("There are no more available sockets to allocate.");
-                }
-            }
-            catch (SocketException ex)
-            {
-                AsyncUserToken token = e.UserToken as AsyncUserToken;
-                Console.WriteLine("Error when processing data received from {0}:\r\n{1}", token.Socket.RemoteEndPoint, ex.ToString());
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine(ex.ToString());
-            }
-
-            // Accept the next connection request.
-            StartAccept(e);
-        }
-        private void ProcessReceive(SocketAsyncEventArgs e)
-        {
-            if (e.BytesTransferred > 0 && e.SocketError == SocketError.Success)
-            {
-                AsyncUserToken token = e.UserToken as AsyncUserToken;
-
-                //´¦Àí½ÓÊÕµ½µÄÊý¾Ý
-                ProcessReceivedData(token.DataStartOffset, token.NextReceiveOffset - token.DataStartOffset + e.BytesTransferred, 0, token, e);
-
-                //¸üÐÂÏÂÒ»¸öÒª½ÓÊÕÊý¾ÝµÄÆðÊ¼Î»ÖÃ
-                token.NextReceiveOffset += e.BytesTransferred;
-
-                //Èç¹û´ïµ½»º³åÇøµÄ½áÎ²£¬Ôò½«NextReceiveOffset¸´Î»µ½»º³åÇøÆðÊ¼Î»ÖÃ£¬²¢Ç¨ÒÆ¿ÉÄÜÐèÒªÇ¨ÒÆµÄÎ´´¦ÀíµÄÊý¾Ý
-                if (token.NextReceiveOffset == e.Buffer.Length)
-                {
-                    //½«NextReceiveOffset¸´Î»µ½»º³åÇøÆðÊ¼Î»ÖÃ
-                    token.NextReceiveOffset = 0;
-
-                    //Èç¹û»¹ÓÐÎ´´¦ÀíµÄÊý¾Ý£¬Ôò°ÑÕâÐ©Êý¾ÝÇ¨ÒÆµ½Êý¾Ý»º³åÇøµÄÆðÊ¼Î»ÖÃ
-                    if (token.DataStartOffset < e.Buffer.Length)
-                    {
-                        var notYesProcessDataSize = e.Buffer.Length - token.DataStartOffset;
-                        Buffer.BlockCopy(e.Buffer, token.DataStartOffset, e.Buffer, 0, notYesProcessDataSize);
-
-                        //Êý¾ÝÇ¨ÒÆµ½»º³åÇøÆðÊ¼Î»ÖÃºó£¬ÐèÒªÔÙ´Î¸üÐÂNextReceiveOffset
-                        token.NextReceiveOffset = notYesProcessDataSize;
-                    }
-
-                    token.DataStartOffset = 0;
-                }
-
-                //¸üÐÂ½ÓÊÕÊý¾ÝµÄ»º³åÇøÏÂ´Î½ÓÊÕÊý¾ÝµÄÆðÊ¼Î»ÖÃºÍ×î´ó¿É½ÓÊÕÊý¾ÝµÄ³¤¶È
-                e.SetBuffer(token.NextReceiveOffset, e.Buffer.Length - token.NextReceiveOffset);
-
-                //½ÓÊÕºóÐøµÄÊý¾Ý
-                if (!token.Socket.ReceiveAsync(e))
-                {
-                    ProcessReceive(e);
+                    ProcessReceive(readEventArgs);
                 }
             }
             else
             {
-                CloseClientSocket(e);
+                Console.WriteLine("There are no more available sockets to allocate.");
             }
         }
-        private void ProcessReceivedData(int dataStartOffset, int totalReceivedDataSize, int alreadyProcessedDataSize, AsyncUserToken token, SocketAsyncEventArgs e)
+        catch (SocketException ex)
         {
-            if (alreadyProcessedDataSize >= totalReceivedDataSize)
+            AsyncUserToken token = e.UserToken as AsyncUserToken;
+            Console.WriteLine("Error when processing data received from {0}:\r\n{1}", token.Socket.RemoteEndPoint, ex.ToString());
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine(ex.ToString());
+        }
+
+        // Accept the next connection request.
+        StartAccept(e);
+    }
+    private void ProcessReceive(SocketAsyncEventArgs e)
+    {
+        if (e.BytesTransferred > 0 && e.SocketError == SocketError.Success)
+        {
+            AsyncUserToken token = e.UserToken as AsyncUserToken;
+
+            //ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Õµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+            ProcessReceivedData(token.DataStartOffset, token.NextReceiveOffset - token.DataStartOffset + e.BytesTransferred, 0, token, e);
+
+            //ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò»ï¿½ï¿½Òªï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ýµï¿½ï¿½ï¿½Ê¼Î»ï¿½ï¿½
+            token.NextReceiveOffset += e.BytesTransferred;
+
+            //ï¿½ï¿½ï¿½ï¿½ïµ½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä½ï¿½Î²ï¿½ï¿½ï¿½ï¿½NextReceiveOffsetï¿½ï¿½Î»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê¼Î»ï¿½Ã£ï¿½ï¿½ï¿½Ç¨ï¿½Æ¿ï¿½ï¿½ï¿½ï¿½ï¿½ÒªÇ¨ï¿½Æµï¿½Î´ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+            if (token.NextReceiveOffset == e.Buffer.Length)
             {
-                return;
+                //ï¿½ï¿½NextReceiveOffsetï¿½ï¿½Î»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê¼Î»ï¿½ï¿½
+                token.NextReceiveOffset = 0;
+
+                //ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Î´ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ý£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ð©ï¿½ï¿½ï¿½ï¿½Ç¨ï¿½Æµï¿½ï¿½ï¿½ï¿½Ý»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê¼Î»ï¿½ï¿½
+                if (token.DataStartOffset < e.Buffer.Length)
+                {
+                    var notYesProcessDataSize = e.Buffer.Length - token.DataStartOffset;
+                    Buffer.BlockCopy(e.Buffer, token.DataStartOffset, e.Buffer, 0, notYesProcessDataSize);
+
+                    //ï¿½ï¿½ï¿½ï¿½Ç¨ï¿½Æµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê¼Î»ï¿½Ãºï¿½ï¿½ï¿½Òªï¿½Ù´Î¸ï¿½ï¿½ï¿½NextReceiveOffset
+                    token.NextReceiveOffset = notYesProcessDataSize;
+                }
+
+                token.DataStartOffset = 0;
             }
 
-            if (token.MessageSize == null)
+            //ï¿½ï¿½ï¿½Â½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ÝµÄ»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Â´Î½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ýµï¿½ï¿½ï¿½Ê¼Î»ï¿½Ãºï¿½ï¿½ï¿½ï¿½É½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ÝµÄ³ï¿½ï¿½ï¿½
+            e.SetBuffer(token.NextReceiveOffset, e.Buffer.Length - token.NextReceiveOffset);
+
+            //ï¿½ï¿½ï¿½Õºï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+            if (!token.Socket.ReceiveAsync(e))
             {
-                //Èç¹ûÖ®Ç°½ÓÊÕµ½µ½Êý¾Ý¼ÓÉÏµ±Ç°½ÓÊÕµ½µÄÊý¾Ý´óÓÚÏûÏ¢Í·µÄ´óÐ¡£¬Ôò¿ÉÒÔ½âÎöÏûÏ¢Í·
-                if (totalReceivedDataSize > MessageHeaderSize)
-                {
-                    //½âÎöÏûÏ¢³¤¶È
-                    var headerData = new byte[MessageHeaderSize];
-                    Buffer.BlockCopy(e.Buffer, dataStartOffset, headerData, 0, MessageHeaderSize);
-                    var messageSize = BitConverter.ToInt32(headerData, 0);
-
-                    token.MessageSize = messageSize;
-                    token.DataStartOffset = dataStartOffset + MessageHeaderSize;
-
-                    //µÝ¹é´¦Àí
-                    ProcessReceivedData(token.DataStartOffset, totalReceivedDataSize, alreadyProcessedDataSize + MessageHeaderSize, token, e);
-                }
-                //Èç¹ûÖ®Ç°½ÓÊÕµ½µ½Êý¾Ý¼ÓÉÏµ±Ç°½ÓÊÕµ½µÄÊý¾ÝÈÔÈ»Ã»ÓÐ´óÓÚÏûÏ¢Í·µÄ´óÐ¡£¬ÔòÐèÒª¼ÌÐø½ÓÊÕºóÐøµÄ×Ö½Ú
-                else
-                {
-                    //ÕâÀï²»ÐèÒª×öÊ²Ã´ÊÂÇé
-                }
+                ProcessReceive(e);
             }
+        }
+        else
+        {
+            CloseClientSocket(e);
+        }
+    }
+    private void ProcessReceivedData(int dataStartOffset, int totalReceivedDataSize, int alreadyProcessedDataSize, AsyncUserToken token, SocketAsyncEventArgs e)
+    {
+        if (alreadyProcessedDataSize >= totalReceivedDataSize)
+        {
+            return;
+        }
+
+        if (token.MessageSize == null)
+        {
+            //ï¿½ï¿½ï¿½Ö®Ç°ï¿½ï¿½ï¿½Õµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ý¼ï¿½ï¿½Ïµï¿½Ç°ï¿½ï¿½ï¿½Õµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ý´ï¿½ï¿½ï¿½ï¿½ï¿½Ï¢Í·ï¿½Ä´ï¿½Ð¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ô½ï¿½ï¿½ï¿½ï¿½ï¿½Ï¢Í·
+            if (totalReceivedDataSize > MessageHeaderSize)
+            {
+                //ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ï¢ï¿½ï¿½ï¿½ï¿½
+                var headerData = new byte[MessageHeaderSize];
+                Buffer.BlockCopy(e.Buffer, dataStartOffset, headerData, 0, MessageHeaderSize);
+                var messageSize = BitConverter.ToInt32(headerData, 0);
+
+                token.MessageSize = messageSize;
+                token.DataStartOffset = dataStartOffset + MessageHeaderSize;
+
+                //ï¿½Ý¹é´¦ï¿½ï¿½
+                ProcessReceivedData(token.DataStartOffset, totalReceivedDataSize, alreadyProcessedDataSize + MessageHeaderSize, token, e);
+            }
+            //ï¿½ï¿½ï¿½Ö®Ç°ï¿½ï¿½ï¿½Õµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ý¼ï¿½ï¿½Ïµï¿½Ç°ï¿½ï¿½ï¿½Õµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½È»Ã»ï¿½Ð´ï¿½ï¿½ï¿½ï¿½ï¿½Ï¢Í·ï¿½Ä´ï¿½Ð¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Òªï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Õºï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö½ï¿½
             else
             {
-                var messageSize = token.MessageSize.Value;
-                //ÅÐ¶Ïµ±Ç°ÀÛ¼Æ½ÓÊÕµ½µÄ×Ö½ÚÊý¼õÈ¥ÒÑ¾­´¦ÀíµÄ×Ö½ÚÊýÊÇ·ñ´óÓÚÏûÏ¢µÄ³¤¶È£¬Èç¹û´óÓÚ£¬ÔòËµÃ÷¿ÉÒÔ½âÎöÏûÏ¢ÁË
-                if (totalReceivedDataSize - alreadyProcessedDataSize >= messageSize)
-                {
-                    var messageData = new byte[messageSize];
-                    Buffer.BlockCopy(e.Buffer, dataStartOffset, messageData, 0, messageSize);
-                    ProcessMessage(messageData, token, e);
+                //ï¿½ï¿½ï¿½ï²»ï¿½ï¿½Òªï¿½ï¿½Ê²Ã´ï¿½ï¿½ï¿½ï¿½
+            }
+        }
+        else
+        {
+            var messageSize = token.MessageSize.Value;
+            //ï¿½Ð¶Ïµï¿½Ç°ï¿½Û¼Æ½ï¿½ï¿½Õµï¿½ï¿½ï¿½ï¿½Ö½ï¿½ï¿½ï¿½ï¿½ï¿½È¥ï¿½Ñ¾ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö½ï¿½ï¿½ï¿½ï¿½Ç·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ï¢ï¿½Ä³ï¿½ï¿½È£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ú£ï¿½ï¿½ï¿½Ëµï¿½ï¿½ï¿½ï¿½ï¿½Ô½ï¿½ï¿½ï¿½ï¿½ï¿½Ï¢ï¿½ï¿½
+            if (totalReceivedDataSize - alreadyProcessedDataSize >= messageSize)
+            {
+                var messageData = new byte[messageSize];
+                Buffer.BlockCopy(e.Buffer, dataStartOffset, messageData, 0, messageSize);
+                ProcessMessage(messageData, token, e);
 
-                    //ÏûÏ¢´¦ÀíÍêºó£¬ÐèÒªÇåÀítoken£¬ÒÔ±ã½ÓÊÕÏÂÒ»¸öÏûÏ¢
-                    token.DataStartOffset = dataStartOffset + messageSize;
-                    token.MessageSize = null;
+                //ï¿½ï¿½Ï¢ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Òªï¿½ï¿½ï¿½ï¿½tokenï¿½ï¿½ï¿½Ô±ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò»ï¿½ï¿½ï¿½ï¿½Ï¢
+                token.DataStartOffset = dataStartOffset + messageSize;
+                token.MessageSize = null;
 
-                    //µÝ¹é´¦Àí
-                    ProcessReceivedData(token.DataStartOffset, totalReceivedDataSize, alreadyProcessedDataSize + messageSize, token, e);
-                }
-                //ËµÃ÷Ê£ÏÂµÄ×Ö½ÚÊý»¹²»¹»×ª»¯ÎªÏûÏ¢£¬ÔòÐèÒª¼ÌÐø½ÓÊÕºóÐøµÄ×Ö½Ú
-                else
-                {
-                    //ÕâÀï²»ÐèÒª×öÊ²Ã´ÊÂÇé
-                }
+                //ï¿½Ý¹é´¦ï¿½ï¿½
+                ProcessReceivedData(token.DataStartOffset, totalReceivedDataSize, alreadyProcessedDataSize + messageSize, token, e);
             }
-        }
-        private void ProcessMessage(byte[] messageData, AsyncUserToken token, SocketAsyncEventArgs e)
-        {
-            var current = Interlocked.Increment(ref _receivedMessageCount);
-            if (current == 1)
-            {
-                _watch = Stopwatch.StartNew();
-            }
-            if (current % 10000 == 0)
-            {
-                Console.WriteLine("received message, length:{0}, count:{1}, timeSpent:{2}", messageData.Length, current, _watch.ElapsedMilliseconds);
-            }
-            sendingQueue.Add(new MessageData { Message = messageData, Token = token });
-        }
-        private void ProcessSend(SocketAsyncEventArgs e)
-        {
-            _socketAsyncSendEventArgsPool.Push(e);
-            waitSendEvent.Set();
-        }
-        private void SendQueueMessage()
-        {
-            while (true)
-            {
-                var messageData = sendingQueue.Take();
-                if (messageData != null)
-                {
-                    SendMessage(messageData, BuildMessage(messageData.Message));
-                }
-            }
-        }
-        private void SendMessage(MessageData messageData, byte[] message)
-        {
-            var sendEventArgs = _socketAsyncSendEventArgsPool.Pop();
-            if (sendEventArgs != null)
-            {
-                sendEventArgs.SetBuffer(message, 0, message.Length);
-                sendEventArgs.UserToken = messageData.Token;
-                messageData.Token.Socket.SendAsync(sendEventArgs);
-            }
+            //Ëµï¿½ï¿½Ê£ï¿½Âµï¿½ï¿½Ö½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½×ªï¿½ï¿½Îªï¿½ï¿½Ï¢ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Òªï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Õºï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö½ï¿½
             else
             {
-                waitSendEvent.WaitOne();
-                SendMessage(messageData, message);
+                //ï¿½ï¿½ï¿½ï²»ï¿½ï¿½Òªï¿½ï¿½Ê²Ã´ï¿½ï¿½ï¿½ï¿½
             }
         }
-        static byte[] BuildMessage(byte[] data)
+    }
+    private void ProcessMessage(byte[] messageData, AsyncUserToken token, SocketAsyncEventArgs e)
+    {
+        var current = Interlocked.Increment(ref _receivedMessageCount);
+        if (current == 1)
         {
-            var header = BitConverter.GetBytes(data.Length);
-            var message = new byte[header.Length + data.Length];
-            header.CopyTo(message, 0);
-            data.CopyTo(message, header.Length);
-            return message;
+            _watch = Stopwatch.StartNew();
         }
-        private void CloseClientSocket(SocketAsyncEventArgs e)
+        if (current % 10000 == 0)
         {
-            var token = e.UserToken as AsyncUserToken;
-            token.Dispose();
-            _acceptedClientsSemaphore.Release();
-            Interlocked.Decrement(ref _connectedSocketCount);
-            Console.WriteLine("A client has been disconnected from the server. There are {0} clients connected to the server", _connectedSocketCount);
-            _socketAsyncReceiveEventArgsPool.Push(e);
+            Console.WriteLine("received message, length:{0}, count:{1}, timeSpent:{2}", messageData.Length, current, _watch.ElapsedMilliseconds);
         }
+        sendingQueue.Add(new MessageData { Message = messageData, Token = token });
+    }
+    private void ProcessSend(SocketAsyncEventArgs e)
+    {
+        _socketAsyncSendEventArgsPool.Push(e);
+        waitSendEvent.Set();
+    }
+    private void SendQueueMessage()
+    {
+        while (true)
+        {
+            var messageData = sendingQueue.Take();
+            if (messageData != null)
+            {
+                SendMessage(messageData, BuildMessage(messageData.Message));
+            }
+        }
+    }
+    private void SendMessage(MessageData messageData, byte[] message)
+    {
+        var sendEventArgs = _socketAsyncSendEventArgsPool.Pop();
+        if (sendEventArgs != null)
+        {
+            sendEventArgs.SetBuffer(message, 0, message.Length);
+            sendEventArgs.UserToken = messageData.Token;
+            messageData.Token.Socket.SendAsync(sendEventArgs);
+        }
+        else
+        {
+            waitSendEvent.WaitOne();
+            SendMessage(messageData, message);
+        }
+    }
+    static byte[] BuildMessage(byte[] data)
+    {
+        var header = BitConverter.GetBytes(data.Length);
+        var message = new byte[header.Length + data.Length];
+        header.CopyTo(message, 0);
+        data.CopyTo(message, header.Length);
+        return message;
+    }
+    private void CloseClientSocket(SocketAsyncEventArgs e)
+    {
+        var token = e.UserToken as AsyncUserToken;
+        token.Dispose();
+        _acceptedClientsSemaphore.Release();
+        Interlocked.Decrement(ref _connectedSocketCount);
+        Console.WriteLine("A client has been disconnected from the server. There are {0} clients connected to the server", _connectedSocketCount);
+        _socketAsyncReceiveEventArgsPool.Push(e);
     }
 }

@@ -1,45 +1,42 @@
-﻿using System;
-using System.Net.Sockets;
-using System.Threading;
+﻿using System.Net.Sockets;
 
-namespace SocketAsyncServer
+namespace SocketAsyncServer;
+
+public sealed class MessageData
 {
-    public sealed class MessageData
+    public AsyncUserToken Token;
+    public byte[] Message;
+}
+public sealed class AsyncUserToken : IDisposable
+{
+    public Socket Socket { get; private set; }
+    public int? MessageSize { get; set; }
+    public int DataStartOffset { get; set; }
+    public int NextReceiveOffset { get; set; }
+
+    public AsyncUserToken(Socket socket)
     {
-        public AsyncUserToken Token;
-        public byte[] Message;
+        Socket = socket;
     }
-    public sealed class AsyncUserToken : IDisposable
+
+    #region IDisposable Members
+
+    public void Dispose()
     {
-        public Socket Socket { get; private set; }
-        public int? MessageSize { get; set; }
-        public int DataStartOffset { get; set; }
-        public int NextReceiveOffset { get; set; }
-
-        public AsyncUserToken(Socket socket)
+        try
         {
-            this.Socket = socket;
+            Socket.Shutdown(SocketShutdown.Send);
         }
+        catch (Exception)
+        { }
 
-        #region IDisposable Members
-
-        public void Dispose()
+        try
         {
-            try
-            {
-                this.Socket.Shutdown(SocketShutdown.Send);
-            }
-            catch (Exception)
-            { }
-
-            try
-            {
-                this.Socket.Close();
-            }
-            catch (Exception)
-            { }
+            Socket.Close();
         }
-
-        #endregion
+        catch (Exception)
+        { }
     }
+
+    #endregion
 }
